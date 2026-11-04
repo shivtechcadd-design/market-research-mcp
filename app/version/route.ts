@@ -1,0 +1,7 @@
+import { versionInfo } from "../../lib/version";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  return Response.json(versionInfo());
+}
