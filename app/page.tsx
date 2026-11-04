@@ -1,15 +1,10 @@
 export default function HomePage() {
   return (
-    <div>
-      <h1>MCP for ChatGPT Deep Research</h1>
-      
-      <p>Protocol is mounted below /mcp.</p>
-      
-      <p>
-        <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fdeep-research-server">
-          <img src="https://vercel.com/button" alt="Deploy with Vercel"/>
-        </a>
-      </p>
-    </div>
+    <main style={{ fontFamily: "sans-serif", maxWidth: 640, margin: "40px auto" }}>
+      <h1>NSE Market Research MCP</h1>
+      <p>The MCP endpoint is available at <code>/mcp</code>.</p>
+      <p>Tools: quote, chart, relative performance, derivatives, SLBM, historical trades, bulk/block deals and filings.</p>
+      <p>Market data only. Not investment advice.</p>
+    </main>
   );
 }
