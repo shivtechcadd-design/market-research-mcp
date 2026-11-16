@@ -341,7 +341,7 @@ function extractHistorical(raw: any) {
 const sym = z.string().describe("NSE stock symbol, e.g. KOTAKBANK");
 const dateArg = z.string().optional().describe("DD-MM-YYYY");
 
-const VERIFIED = ["get_stock_quote", "get_historical_trades"];
+const VERIFIED = ["get_stock_quote", "get_historical_trades","get_recommended_stocks"];
 
 const handler = createMcpHandler(
   async (server) => {
@@ -518,6 +518,45 @@ const handler = createMcpHandler(
         return reply(listResult("getIntegratedFilingData", cleanSymbol(symbol), r.data, 8));
       }
     );
+
+    add(
+      "get_recommended_stocks",
+      "Research360 (Motilal Oswal) curated stock calls: short-term conviction delivery ideas (up to 2 weeks) and intraday calls. Returns entry, target, stoploss, LTP, action, report link, plus derived risk-reward and upside. Not tied to a symbol.",
+      {
+        call_type: z.enum(["short_term", "intraday", "both"]).default("both"),
+        status: z.enum(["open", "closed"]).default("open"),
+        action: z.enum(["Buy", "Sell", ""]).default(""),
+        limit: z.number().int().min(1).max(100).default(25),
+      },
+      async ({ call_type, status, action, limit }) => {
+        const kinds = (call_type === "both" ? ["short_term", "intraday"] : [call_type]) as (keyof typeof CALL_TYPES)[];
+        const results = await Promise.all(kinds.map((k) => r360Fetch(CALL_TYPES[k], status, action)));
+
+        const data: Record<string, any> = {};
+        const errors: string[] = [];
+        kinds.forEach((k, i) => {
+          const r = results[i];
+          if ("error" in r) {
+            errors.push(`${k}: ${r.error}`);
+            return;
+          }
+          const rows = r.rows.map(slimCall);
+          data[k] = { total_calls: rows.length, returned: Math.min(limit, rows.length), calls: rows.slice(0, limit) };
+        });
+
+        if (!Object.keys(data).length)
+          return reply({ build_version: BUILD_VERSION, error: errors.join("; ") }, true);
+
+        return reply(
+          envelope("research360/alpha-picks/calls", null, true, data, [
+            "short_term = calltype 101, intraday = calltype 102. Newest first.",
+            "Prices exactly as published; derived_not_from_source values are computed here from entry/target/stoploss/ltp.",
+            "Source fields 'current_price' (actually % move vs entry) and 'profit_loss' (-100 on open calls) are omitted as misleading.",
+            ...errors,
+          ])
+        );
+      }
+    );
   },
   {},
   { basePath: "", verboseLogs: true, maxDuration: 60, disableSse: true }
@@ -537,3 +576,90 @@ const guard =
 
 const guarded = guard(handler as unknown as (req: Request) => Promise<Response>);
 export { guarded as GET, guarded as POST, guarded as DELETE };
+
+// ---------- Research360 alpha picks ----------
+const R360_URL = "https://www.research360.in/api/alpha-picks/calls";
+const R360_HEADERS = {
+  "Content-Type": "application/json",
+  "User-Agent": headers["User-Agent"],
+  ...(process.env.R360_COOKIE ? { Cookie: process.env.R360_COOKIE } : {}),
+};
+const CALL_TYPES = { short_term: "101", intraday: "102" } as const;
+
+async function r360Fetch(calltypeId: string, status: string, action: string) {
+  try {
+    const res = await fetch(R360_URL, {
+      method: "POST",
+      headers: R360_HEADERS,
+      body: JSON.stringify({
+        calltype_id: calltypeId,
+        status,
+        action,
+        mcap: "",
+        sort_column: "moexcul_latestupd DESC",
+        sort_direction: "",
+        search: "",
+        pagenumber: 1,
+        pagesize: 500,
+      }),
+      signal: AbortSignal.timeout(15000),
+      cache: "no-store",
+    });
+    const text = await res.text();
+    if (!res.ok) return { error: `Research360 HTTP ${res.status}`, sample: text.slice(0, 200) };
+    try {
+      const json = JSON.parse(text);
+      if (json?.code !== 200 || !Array.isArray(json.data))
+        return { error: `Unexpected Research360 response (code ${json?.code})`, sample: text.slice(0, 200) };
+      return { rows: json.data as any[] };
+    } catch {
+      return { error: "Research360 returned non-JSON", sample: text.slice(0, 200) };
+    }
+  } catch (e) {
+    return { error: `Failed to connect to Research360: ${String(e)}` };
+  }
+}
+
+function slimCall(r: any) {
+  const buy = String(r.action).toLowerCase() !== "sell";
+  const entry = num(r.entry_price), target = num(r.targetprice), sl = num(r.stoploss), ltp = num(r.ltp);
+
+  const reward = entry !== null && target !== null ? Math.abs(target - entry) : null;
+  const risk = entry !== null && sl !== null ? Math.abs(entry - sl) : null;
+
+  const out: Record<string, any> = {
+    call_id: r.callid,
+    symbol: r.tradesymbol,
+    company: r.comp_long_nm ?? r.co_name,
+    action: r.action,
+    product: r.call_product_type,
+    mcap_category: r.mcap_category ?? null,
+    entry,
+    target,
+    stoploss: sl,
+    ltp,
+    day_change_pct: rnd(num(r.change_per)),
+    recommended_at_ist: r.recodate ?? null,
+    status: r.status,
+    research_report_url: r.research_report_url ?? null,
+    derived_not_from_source: {
+      move_since_entry_pct:
+        entry && ltp !== null ? rnd(((ltp - entry) / entry) * (buy ? 100 : -100)) : null,
+      upside_to_target_from_ltp_pct:
+        target !== null && ltp ? rnd(((target - ltp) / ltp) * (buy ? 100 : -100)) : null,
+      distance_to_sl_from_ltp_pct:
+        sl !== null && ltp ? rnd((Math.abs(ltp - sl) / ltp) * 100) : null,
+      risk_reward: reward !== null && risk ? rnd(reward / risk) : null,
+    },
+  };
+
+  // Only for derivative calls (intraday may include these)
+  if (r.expirydate && r.expirydate !== "0000-00-00") out.expiry = r.expirydate;
+  if (r.strikeprice) out.strike = num(r.strikeprice);
+  if (r.futopt_flg) out.fut_opt = r.futopt_flg;
+  if (r.status !== "open") {
+    out.exit_price = num(r.exitprice);
+    out.exit_date = r.exitdate;
+  }
+  return out;
+}
