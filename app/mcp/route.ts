@@ -341,7 +341,7 @@ function extractHistorical(raw: any) {
 const sym = z.string().describe("NSE stock symbol, e.g. KOTAKBANK");
 const dateArg = z.string().optional().describe("DD-MM-YYYY");
 
-const VERIFIED = ["get_stock_quote", "get_historical_trades","get_recommended_stocks"];
+const VERIFIED = ["get_stock_quote", "get_historical_trades","get_recommended_stocks","get_intraday_candles"];
 
 const handler = createMcpHandler(
   async (server) => {
@@ -557,6 +557,94 @@ const handler = createMcpHandler(
         );
       }
     );
+
+    add(
+      "get_intraday_candles",
+      "NSE intraday OHLCV candles for an equity at 1, 3, 5, 10, 15, 30 or 60 minute intervals. Returns the most recent N candles (oldest to newest) with IST timestamps, plus period high/low, VWAP and change computed from ALL candles in the lookback window.",
+      {
+        symbol: sym,
+        interval: z.enum(["1", "3", "5", "10", "15", "30", "60"]).default("5").describe("Candle size in minutes"),
+        days: z.number().int().min(1).max(30).default(1).describe("Lookback in calendar days"),
+        limit: z.number().int().min(1).max(300).default(100).describe("Max candles returned (latest)"),
+      },
+      async ({ symbol, interval, days, limit }) => {
+        const s = cleanSymbol(symbol);
+        const tk = await resolveToken(s);
+        if (tk.error) return errReply(tk.error);
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const r = await chartGet("/charts/symbolHistoricalData", {
+          token: tk.token!,
+          fromDate: nowSec - days * 86400,
+          toDate: nowSec,
+          symbol: s,
+          symbolType: "Equity",
+          chartType: "I",
+          timeInterval: Number(interval),
+        });
+        if (r.error) return errReply(r);
+
+        const all = toCandles(r.data);
+        if (!all) {
+          return reply(
+            envelope("symbolHistoricalData", s, false,
+              { raw_sample: JSON.stringify(r.data).slice(0, 1500) },
+              ["Could not recognise the candle format; raw sample returned so the parser can be adjusted."])
+          );
+        }
+        if (!all.length) {
+          return reply(
+            envelope("symbolHistoricalData", s, true, { candles: [] },
+              ["NSE returned no candles for this window (market closed, holiday, or range too short). Try a larger 'days'."])
+          );
+        }
+
+        const highs = all.map((x) => x.h).filter((x): x is number => x !== null);
+        const lows = all.map((x) => x.l).filter((x): x is number => x !== null);
+        const vol = all.reduce((a, x) => a + (x.v ?? 0), 0);
+        const pv = all.reduce(
+          (a, x) => a + (x.v && x.h !== null && x.l !== null && x.c !== null ? ((x.h + x.l + x.c) / 3) * x.v : 0),
+          0
+        );
+        const first = all[0], last = all[all.length - 1];
+
+        const candles = all.slice(-limit).map((x) => ({
+          time_ist: istStamp(x.t),
+          epoch_utc: x.t,
+          open: x.o,
+          high: x.h,
+          low: x.l,
+          close: x.c,
+          volume: x.v,
+        }));
+
+        return reply(
+          envelope("symbolHistoricalData", s, true, {
+            interval_minutes: Number(interval),
+            total_candles: all.length,
+            returned_candles: candles.length,
+            first_candle_ist: istStamp(first.t),
+            last_candle_ist: istStamp(last.t),
+            market: marketSession(),
+            derived_not_from_nse: {
+              period_high: highs.length ? Math.max(...highs) : null,
+              period_low: lows.length ? Math.min(...lows) : null,
+              first_open: first.o,
+              last_close: last.c,
+              change_pct: first.o && last.c !== null ? rnd(((last.c - first.o) / first.o) * 100) : null,
+              total_volume: vol || null,
+              approx_vwap: vol ? rnd(pv / vol) : null,
+            },
+            candles,
+          }, [
+            "Candles are oldest to newest. Stats cover all candles in the window, not just the returned ones.",
+            "approx_vwap uses (high+low+close)/3 per candle weighted by volume.",
+            `Candle timestamps treated as ${CANDLE_TIME_IS_IST ? "IST-shifted epoch (NSE charting convention)" : "true UTC epoch"}.`,
+            "Last candle may still be forming if the market is open.",
+          ])
+        );
+      }
+    );
   },
   {},
   { basePath: "", verboseLogs: true, maxDuration: 60, disableSse: true }
@@ -663,3 +751,83 @@ function slimCall(r: any) {
   }
   return out;
 }
+
+// ---------- NSE charting (intraday candles) ----------
+const CHART_BASE = process.env.NSE_CHART_BASE_URL ?? "https://charting.nseindia.in/v1";
+const CHART_HEADERS = { "User-Agent": "Mozilla/5.0", Accept: "application/json" };
+const tokenCache = new Map<string, { token: string; symbol: string }>();
+
+// NSE charting sends `time` in epoch ms, apparently shifted +5.5h (reads as IST).
+// Set CANDLE_TIME_IS_IST=false in env if timestamps turn out to be true UTC.
+const CANDLE_TIME_IS_IST = process.env.CANDLE_TIME_IS_IST !== "false";
+
+async function chartGet(path: string, params: Record<string, string | number>): Promise<NseResult> {
+  const url = new URL(`${CHART_BASE}${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  let last: NseResult = { error: "unknown" };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: CHART_HEADERS, signal: AbortSignal.timeout(15000), cache: "no-store" });
+      const text = await res.text();
+      if (res.ok) {
+        try {
+          return { data: JSON.parse(text), status: res.status };
+        } catch {
+          return { error: "NSE charting returned non-JSON", sample: text.slice(0, 200), status: res.status };
+        }
+      }
+      last = { error: `NSE charting HTTP ${res.status}`, sample: text.slice(0, 200), status: res.status };
+      if (res.status !== 429 && res.status < 500) return last;
+    } catch (e) {
+      last = { error: `Failed to connect to NSE charting: ${String(e)}` };
+    }
+    await sleep(500 * attempt);
+  }
+  return last;
+}
+
+async function resolveToken(symbol: string): Promise<{ token?: string; symbol?: string; error?: NseResult }> {
+  const hit = tokenCache.get(symbol);
+  if (hit) return hit;
+  const r = await chartGet("/exchanges/symbolsDynamic", { symbol, segment: "EQ" });
+  if (r.error) return { error: r };
+  const first = r.data?.status && Array.isArray(r.data?.data) ? r.data.data[0] : null;
+  if (!first?.scripcode) return { error: { error: `Symbol ${symbol} not found on NSE charting` } };
+  const found = { token: String(first.scripcode), symbol: String(first.symbol ?? symbol) };
+  tokenCache.set(symbol, found);
+  return found;
+}
+
+type Candle = { t: number; o: number | null; h: number | null; l: number | null; c: number | null; v: number | null };
+
+// Verified shape: [{ time(ms), open, high, low, close, volume }, ...]
+// Returns candles sorted oldest -> newest with t as TRUE UTC seconds.
+function toCandles(raw: any): Candle[] | null {
+  const rows = rowsOf(raw);
+  if (!rows) return null;
+  if (!rows.length) return [];
+  if (rows[0]?.time === undefined || rows[0]?.close === undefined) return null;
+
+  const seen = new Set<number>();
+  return rows
+    .map((r) => ({
+      t: Math.round(Number(r.time) / 1000) - (CANDLE_TIME_IS_IST ? IST_MS / 1000 : 0),
+      o: num(r.open),
+      h: num(r.high),
+      l: num(r.low),
+      c: num(r.close),
+      v: num(r.volume),
+    }))
+    .filter((x) => {
+      if (!Number.isFinite(x.t) || seen.has(x.t)) return false;
+      seen.add(x.t);
+      return true;
+    })
+    .sort((a, b) => a.t - b.t);
+}
+
+// true UTC seconds -> "DD-MM-YYYY HH:MM" in IST
+const istStamp = (sec: number) => {
+  const x = new Date(sec * 1000 + IST_MS);
+  return `${istDDMMYYYY(new Date(sec * 1000))} ${pad(x.getUTCHours())}:${pad(x.getUTCMinutes())}`;
+};
