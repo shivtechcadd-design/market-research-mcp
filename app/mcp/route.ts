@@ -575,7 +575,7 @@ const handler = createMcpHandler(
         const nowSec = Math.floor(Date.now() / 1000);
         const r = await chartGet("/charts/symbolHistoricalData", {
           token: tk.token!,
-          fromDate: nowSec - days * 86400,
+          fromDate: 0,
           toDate: nowSec,
           symbol: s,
           symbolType: "Equity",
